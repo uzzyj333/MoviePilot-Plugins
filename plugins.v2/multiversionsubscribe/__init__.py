@@ -13,9 +13,12 @@
 import threading
 import time
 import traceback
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from apscheduler.triggers.cron import CronTrigger
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 from app.chain.download import DownloadChain
 from app.chain.search import SearchChain
@@ -32,6 +35,30 @@ from app.schemas.types import EventType, MediaType, NotificationType, SystemConf
 
 # 规格字段：名称 | 分辨率 | 质量 | 特效 | 包含 | 排除 | 大小(GB)
 SPEC_FIELDS = ("name", "resolution", "quality", "effect", "include", "exclude", "size")
+
+# 预设画质规格：(key, 名称, 过滤参数)
+# 关键词取自 MoviePilot 内置过滤规则，匹配时忽略大小写
+SPEC_PRESETS: Tuple[Tuple[str, str, dict], ...] = (
+    ("1080p", "1080p", {"resolution": r"1080[pi]|x1080"}),
+    ("4k", "4K", {"resolution": r"4k|2160p|x2160"}),
+    ("720p", "720p", {"resolution": r"720[pi]|x720"}),
+    ("dv", "杜比视界（Dolby Vision）", {"effect": r"Dolby[\s.]+Vision|DOVI|[\s.]+DV[\s.]+|杜比视界"}),
+    ("hdr", "HDR", {"effect": r"[\s.]+HDR[\s.]+|HDR10|HDR10\+|HDRVivid"}),
+    ("atmos", "杜比全景声", {"effect": r"Dolby[\s.+]+Atmos|Atmos|杜比全景[声效]"}),
+    ("remux", "REMUX", {"quality": r"REMUX"}),
+    ("bluray", "Blu-ray", {"quality": r"Blu-?Ray"}),
+    ("webdl", "WEB-DL", {"quality": r"WEB-?DL|WEB-?RIP"}),
+    ("uhd", "UHD", {"quality": r"UHD|UltraHD"}),
+    ("h265", "H265/HEVC", {"quality": r"[Hx].?265|HEVC"}),
+    ("cnsub", "中字", {"include": r"中字|中文字幕|简中|繁中|简体|繁体|简英|chs|cht"}),
+    ("specsub", "特效字幕", {"include": r"特效"}),
+    ("60fps", "60FPS", {"effect": r"60fps|60帧"}),
+)
+
+# key -> (名称, 过滤参数)
+SPEC_PRESET_MAP: Dict[str, Tuple[str, dict]] = {
+    key: (name, params) for key, name, params in SPEC_PRESETS
+}
 
 
 def _col(component: str, props: dict, md: int = 6) -> dict:
@@ -83,7 +110,7 @@ class MultiVersionSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "torrent.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "uzzyj333"
     # 作者主页
@@ -98,8 +125,8 @@ class MultiVersionSubscribe(_PluginBase):
     # 配置
     _enabled: bool = False
     _subscribes: List[str] = []
+    _spec_presets: List[str] = []
     _specs_text: str = ""
-    _cron: str = "0 */6 * * *"
     _notify: bool = False
     _auto_pause: bool = True
     _auto_delete: bool = False
@@ -111,6 +138,8 @@ class MultiVersionSubscribe(_PluginBase):
     # 运行态
     _specs: List[dict] = []
     _running: bool = False
+    # 「保存后立即运行一次」使用的独立调度器
+    _scheduler: Optional[BackgroundScheduler] = None
 
     def __init__(self):
         super().__init__()
@@ -120,12 +149,14 @@ class MultiVersionSubscribe(_PluginBase):
     # 生命周期
     # ------------------------------------------------------------------ #
     def init_plugin(self, config: dict = None):
+        # 停止现有任务（「立即运行一次」的调度器）
+        self.stop_service()
         self._specs = []
         if config:
             self._enabled = bool(config.get("enabled"))
             self._subscribes = [str(item) for item in (config.get("subscribes") or [])]
+            self._spec_presets = [str(item) for item in (config.get("spec_presets") or [])]
             self._specs_text = config.get("specs") or ""
-            self._cron = (config.get("cron") or "").strip()
             self._notify = bool(config.get("notify"))
             self._auto_pause = config.get("auto_pause", True)
             self._auto_delete = bool(config.get("auto_delete"))
@@ -139,42 +170,59 @@ class MultiVersionSubscribe(_PluginBase):
         if not self._enabled:
             return
 
-        self._specs = self.__parse_specs(self._specs_text)
+        self._specs = self.__resolve_specs(self._spec_presets, self._specs_text)
         if not self._specs:
-            logger.warn("多版本订阅：未配置有效的画质规格，插件不会下载任何资源")
+            logger.error("多版本订阅：没有选择任何画质规格，插件不会下载任何资源")
+        else:
+            logger.info(f"多版本订阅：生效规格 {[spec.get('name') for spec in self._specs]}")
         if not self._subscribes:
-            logger.warn("多版本订阅：未选择任何订阅，插件不会处理任何内容")
+            logger.error("多版本订阅：没有选择任何订阅，插件不会处理任何内容")
 
-        # 立即运行一次
+        # 立即运行一次：延迟 3 秒，避免与配置保存请求相互影响
         if self._onlyonce:
             self._onlyonce = False
             self.__update_config()
-            threading.Thread(target=self.check, name="MultiVersionSubscribe-Once", daemon=True).start()
+            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+            self._scheduler.add_job(
+                func=self.check,
+                trigger="date",
+                run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                name="多版本订阅-立即运行"
+            )
+            if self._scheduler.get_jobs():
+                self._scheduler.start()
+                logger.info("多版本订阅：已安排 3 秒后立即运行一次")
 
     def get_state(self) -> bool:
         return self._enabled
 
     def stop_service(self):
         """
-        退出插件（定时任务由宿主统一管理，这里无需额外处理）
+        停止插件服务（仅用于「保存后立即运行一次」的独立调度器）
         """
-        pass
+        try:
+            if self._scheduler:
+                self._scheduler.remove_all_jobs()
+                if self._scheduler.running:
+                    self._scheduler.shutdown(wait=False)
+                self._scheduler = None
+        except Exception as err:
+            logger.error(f"多版本订阅：停止定时服务出错：{err}")
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
-        注册定时服务
+        注册定时服务：执行周期跟随系统的「订阅搜索时间间隔」，不再单独配置 cron
         """
-        if self._enabled and self._cron:
-            try:
-                return [{
-                    "id": "MultiVersionSubscribe",
-                    "name": "多版本订阅",
-                    "trigger": CronTrigger.from_crontab(self._cron),
-                    "func": self.check,
-                    "kwargs": {}
-                }]
-            except Exception as err:
-                logger.error(f"多版本订阅：cron 表达式无效：{self._cron} - {err}")
+        if self._enabled:
+            hours = self.__system_interval_hours()
+            logger.info(f"多版本订阅：注册定时服务（跟随系统），每 {hours} 小时执行一次")
+            return [{
+                "id": "MultiVersionSubscribe",
+                "name": f"多版本订阅（每 {hours} 小时）",
+                "trigger": IntervalTrigger(hours=hours),
+                "func": self.check,
+                "kwargs": {}
+            }]
         return []
 
     @staticmethod
@@ -249,6 +297,8 @@ class MultiVersionSubscribe(_PluginBase):
     def api_clear(self):
         self.save_data("history", [])
         self.save_data("progress", {})
+        self.save_data("downloaded", {})
+        self.save_data("last_result", {})
         return {"success": True, "message": "已清空记录"}
 
     # ------------------------------------------------------------------ #
@@ -277,6 +327,11 @@ class MultiVersionSubscribe(_PluginBase):
         except Exception as err:
             logger.error(f"多版本订阅：读取下载器列表失败：{err}")
 
+        # 可选的画质规格（预设，多选）
+        spec_items = [{"title": name, "value": key} for key, name, _ in SPEC_PRESETS]
+        # 跟随系统的执行周期
+        interval_hours = self.__system_interval_hours()
+
         return [
             {
                 "component": "VForm",
@@ -293,15 +348,15 @@ class MultiVersionSubscribe(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            _col("VCronField", {
-                                "model": "cron",
-                                "label": "执行周期",
-                                "placeholder": "5位cron表达式，如 0 */6 * * *"
-                            }, 6),
                             _col("VSelect", {
                                 "model": "downloader",
                                 "label": "下载器",
                                 "items": downloader_items
+                            }, 6),
+                            _col("VTextField", {
+                                "model": "save_path",
+                                "label": "保存目录",
+                                "placeholder": "留空使用媒体默认下载目录，如 /downloads/mvsub"
                             }, 6),
                         ]
                     },
@@ -321,40 +376,51 @@ class MultiVersionSubscribe(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            _col("VTextarea", {
-                                "model": "specs",
-                                "label": "画质规格（每行一个）",
-                                "rows": 6,
-                                "placeholder": "每行一个规格，用 | 分隔，第一个字段为规格名称，其余用 key=value：\n"
-                                               "可用键：resolution / quality / effect / include / exclude / size\n"
-                                               "同一字段内多个关键词用英文逗号分隔，会转为正则或关系；未填写的字段不参与过滤。\n"
-                                               "示例：\n"
-                                               "1080p | resolution=1080[pi] | quality=BluRay\n"
-                                               "4K | resolution=2160p | size=>8\n"
-                                               "杜比视界 | resolution=2160p | effect=Dolby[\\. ]+Vision,杜比视界"
+                            _col("VSelect", {
+                                "model": "spec_presets",
+                                "label": "画质规格（可多选，选几个就下几个版本）",
+                                "multiple": True,
+                                "chips": True,
+                                "clearable": True,
+                                "items": spec_items
                             }, 12),
                         ]
                     },
                     {
                         "component": "VRow",
                         "content": [
-                            _col("VTextField", {
-                                "model": "save_path",
-                                "label": "保存目录",
-                                "placeholder": "留空使用媒体默认下载目录，如 /downloads/mvsub"
-                            }, 6),
-                            _col("VSwitch", {
-                                "model": "download_all",
-                                "label": "同一规格下载所有匹配资源（默认只下载第一个未下载过的）"
-                            }, 6),
+                            _col("VTextarea", {
+                                "model": "specs",
+                                "label": "自定义规格（可选，上面的预设不够用时再填）",
+                                "rows": 3,
+                                "placeholder": "每行一个，用 | 分隔，第一个字段为名称，其余用 key=value：\n"
+                                               "可用键：resolution / quality / effect / include / exclude / size（单位 GB）\n"
+                                               "示例：蓝光原盘 | resolution=1080[pi] | quality=REMUX | size=>20"
+                            }, 12),
                         ]
                     },
                     {
                         "component": "VRow",
                         "content": [
                             _col("VSwitch", {
+                                "model": "download_all",
+                                "label": "同一规格下载所有匹配资源（默认每个规格只下第一个）"
+                            }, 6),
+                            _col("VSwitch", {
                                 "model": "auto_delete",
                                 "label": "下载完成后自动删除任务及文件（危险：不可恢复）"
+                            }, 6),
+                        ]
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            _col("VAlert", {
+                                "type": "info",
+                                "variant": "tonal",
+                                "text": f"执行周期跟随系统：每 {interval_hours} 小时运行一次，"
+                                        "与「设置 → 订阅」中的「订阅搜索时间间隔」保持一致，无需单独配置。"
+                                        "想立刻执行可点详情页的「立即运行」，或使用命令 /mvsub。"
                             }, 12),
                         ]
                     },
@@ -365,9 +431,10 @@ class MultiVersionSubscribe(_PluginBase):
                                 "type": "info",
                                 "variant": "tonal",
                                 "text": "使用方式：在 MoviePilot 订阅页面只设置「订阅站点」和「过滤规则组」，"
-                                        "不要设置画质/分辨率/特效，把该订阅加入上方列表即可。"
+                                        "不要设置画质/分辨率/特效；把该订阅加入上方列表，再勾选你想要的画质规格即可。"
                                         "启用「接管订阅」后插件会把该订阅置为暂停，避免原生搜索重复下载；"
-                                        "需要恢复时点击详情页的「恢复订阅」。"
+                                        "需要恢复时点击详情页的「恢复订阅状态」。"
+                                        "同一个种子同时命中多个规格时只会下载一次。"
                             }, 12),
                         ]
                     }
@@ -380,8 +447,8 @@ class MultiVersionSubscribe(_PluginBase):
             "auto_delete": self._auto_delete,
             "download_all": self._download_all,
             "onlyonce": False,
-            "cron": self._cron,
             "subscribes": self._subscribes,
+            "spec_presets": self._spec_presets,
             "specs": self._specs_text,
             "save_path": self._save_path,
             "downloader": self._downloader,
@@ -389,6 +456,7 @@ class MultiVersionSubscribe(_PluginBase):
 
     def get_page(self) -> Optional[List[dict]]:
         last_run = self.get_data("last_run") or "尚未运行"
+        last_result = self.get_data("last_result") or {}
         progress = self.get_data("progress") or {}
         history = self.get_data("history") or []
 
@@ -400,9 +468,19 @@ class MultiVersionSubscribe(_PluginBase):
                     "variant": "tonal",
                     "class": "mb-3",
                     "text": f"状态：{'已启用' if self._enabled else '未启用'}　"
-                            f"规格数：{len(self._specs)}　"
-                            f"接管订阅数：{len(self._subscribes)}　"
+                            f"画质规格：{len(self._specs)} 个　"
+                            f"接管订阅：{len(self._subscribes)} 个　"
+                            f"执行周期：每 {self.__system_interval_hours()} 小时（跟随系统）　"
                             f"上次运行：{last_run}"
+                }
+            },
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": str(last_result.get("type") or "info"),
+                    "variant": "tonal",
+                    "class": "mb-3",
+                    "text": str(last_result.get("text") or "还没有运行过，点下面的「立即运行」试试。")
                 }
             },
             {
@@ -459,35 +537,48 @@ class MultiVersionSubscribe(_PluginBase):
         定时/手动触发的搜索下载流程
         """
         if not self._enabled:
+            self.__record_result("warning", "插件未启用，本次未执行。")
             return
         if self._running:
             logger.info("多版本订阅：上一次任务仍在执行，本次跳过")
             return
         if not self._specs:
-            logger.warn("多版本订阅：未配置画质规格，跳过")
+            logger.error("多版本订阅：没有选择任何画质规格，跳过")
+            self.__record_result("error", "没有选择任何画质规格，请到插件设置里勾选「画质规格」。")
+            return
+        if not self._subscribes:
+            logger.error("多版本订阅：没有选择任何订阅，跳过")
+            self.__record_result("error", "没有选择任何订阅，请到插件设置里选择要接管的订阅。")
             return
         self._running = True
+        self.save_data("last_run", time.strftime("%Y-%m-%d %H:%M:%S"))
+        logger.info(
+            f"多版本订阅：开始执行，规格 {len(self._specs)} 个 / 订阅 {len(self._subscribes)} 个"
+        )
         try:
             subscribes = self.__get_target_subscribes()
             if not subscribes:
                 logger.info("多版本订阅：没有需要处理的订阅")
+                self.__record_result("warning", "没有找到可处理的订阅（订阅可能已被删除）。")
                 return
-            logger.info(f"多版本订阅：开始处理 {len(subscribes)} 个订阅 ...")
             total = 0
+            details: List[str] = []
             for subscribe in subscribes:
                 try:
-                    total += self.__process_subscribe(subscribe)
+                    added = self.__process_subscribe(subscribe)
+                    total += added
+                    details.append(f"{subscribe.name} 新增 {added} 个任务")
                 except Exception as err:
                     logger.error(
                         f"多版本订阅：处理订阅「{getattr(subscribe, 'name', '')}」出错："
                         f"{err} - {traceback.format_exc()}"
                     )
+                    details.append(f"{getattr(subscribe, 'name', '')} 出错（详见日志）")
             if self._auto_delete:
                 try:
                     self.__auto_delete()
                 except Exception as err:
                     logger.error(f"多版本订阅：自动删除任务出错：{err} - {traceback.format_exc()}")
-            self.save_data("last_run", time.strftime("%Y-%m-%d %H:%M:%S"))
             if self._notify and total:
                 self.post_message(
                     mtype=NotificationType.Plugin,
@@ -495,6 +586,10 @@ class MultiVersionSubscribe(_PluginBase):
                     text=f"本次共添加 {total} 个下载任务"
                 )
             logger.info(f"多版本订阅：本次共添加 {total} 个下载任务")
+            self.__record_result(
+                "success" if total else "info",
+                f"本次新增 {total} 个下载任务；" + "；".join(details)
+            )
         finally:
             self._running = False
 
@@ -599,6 +694,10 @@ class MultiVersionSubscribe(_PluginBase):
         done_torrents = set(spec_state.get("torrents") or [])
         done_episodes = {int(item) for item in (spec_state.get("episodes") or []) if str(item).isdigit()}
 
+        # 同一个订阅下，同一种子只下载一次（不同规格可能同时命中同一个种子）
+        all_downloaded = self.get_data("downloaded") or {}
+        sub_downloaded = set(all_downloaded.get(sub_key) or [])
+
         is_tv = mediainfo.type == MediaType.TV
         all_episodes = self.__all_episodes(subscribe)
 
@@ -611,7 +710,7 @@ class MultiVersionSubscribe(_PluginBase):
         for context in candidates:
             torrent = context.torrent_info
             torrent_key = self.__torrent_key(torrent)
-            if torrent_key in done_torrents:
+            if torrent_key in done_torrents or torrent_key in sub_downloaded:
                 continue
 
             episodes: Optional[Set[int]] = None
@@ -644,6 +743,7 @@ class MultiVersionSubscribe(_PluginBase):
 
             count += 1
             done_torrents.add(torrent_key)
+            sub_downloaded.add(torrent_key)
             if is_tv:
                 if covered:
                     done_episodes |= covered
@@ -660,9 +760,14 @@ class MultiVersionSubscribe(_PluginBase):
                 if not all_episodes or not (all_episodes - done_episodes):
                     break
 
+        if count == 0 and candidates:
+            logger.info(f"多版本订阅：「{subscribe.name}」规格「{spec_name}」的候选资源都已下载过，跳过")
+
         spec_state["torrents"] = sorted(done_torrents)
         spec_state["episodes"] = sorted(done_episodes)
+        all_downloaded[sub_key] = sorted(sub_downloaded)
         self.save_data("progress", progress)
+        self.save_data("downloaded", all_downloaded)
         return count
 
     def __auto_delete(self):
@@ -704,8 +809,8 @@ class MultiVersionSubscribe(_PluginBase):
         self.update_config({
             "enabled": self._enabled,
             "subscribes": self._subscribes,
+            "spec_presets": self._spec_presets,
             "specs": self._specs_text,
-            "cron": self._cron,
             "notify": self._notify,
             "auto_pause": self._auto_pause,
             "auto_delete": self._auto_delete,
@@ -714,6 +819,51 @@ class MultiVersionSubscribe(_PluginBase):
             "downloader": self._downloader,
             "onlyonce": False
         })
+
+    def __record_result(self, level: str, text: str):
+        """
+        记录最近一次运行结果，供详情页展示
+        """
+        self.save_data("last_result", {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "type": level,
+            "text": text
+        })
+
+    @staticmethod
+    def __system_interval_hours() -> int:
+        """
+        跟随系统的「订阅搜索时间间隔」（小时）
+        """
+        try:
+            hours = int(getattr(settings, "SUBSCRIBE_SEARCH_INTERVAL", 0) or 0)
+        except Exception:
+            hours = 0
+        return hours if hours > 0 else 24
+
+    @staticmethod
+    def __resolve_specs(preset_keys: List[str], specs_text: str) -> List[dict]:
+        """
+        合并「预设画质规格」与「自定义规格」，名称去重
+        """
+        specs: List[dict] = []
+        seen: Set[str] = set()
+        for key in preset_keys or []:
+            preset = SPEC_PRESET_MAP.get(str(key))
+            if not preset:
+                continue
+            name, params = preset
+            if name in seen:
+                continue
+            seen.add(name)
+            specs.append({"name": name, "params": dict(params), "preset": str(key)})
+        for spec in MultiVersionSubscribe.__parse_specs(specs_text):
+            name = spec.get("name")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            specs.append(spec)
+        return specs
 
     def __get_target_subscribes(self) -> List[Any]:
         try:
